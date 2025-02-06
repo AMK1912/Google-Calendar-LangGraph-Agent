@@ -1,14 +1,13 @@
 import googleapiclient.discovery
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from typing import TypedDict
 from langgraph.graph import StateGraph
 from auth import authenticate_google
 from dotenv import load_dotenv
-import os
-import json
-import re
+from typing import Optional
+import os, json, re, pytz
 from datetime import datetime, timedelta
-import pytz
 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
@@ -19,20 +18,29 @@ service = googleapiclient.discovery.build("calendar", "v3", credentials=creds)
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=api_key)
 
-class CalendarState(TypedDict):
+class EventDetails(BaseModel):
+    title: str
+    start_time: str
+    end_time: str
+
+
+class CalendarState(BaseModel):
     user_input: str
-    event_details: dict
-    availability_status: str
-    confirmation: str
-    status: str
-    final_message: str  # New field for final status message
-    event_link: str     # New field for calendar event link
-    error_message: str
+    event_details:  Optional[EventDetails] = None
+    availability_status: str = ""
+    confirmation: str = ""
+    status: str = ""
+    final_message: str = "" 
+    event_link: str = ""     
+    error_message: str = ""
 
 
+    class Config:
+        arbitrary_types_allowed = True
+                                                                                                          
 def extract_event_details(state: CalendarState):
-    user_input= state["user_input"]
-    prompt = f"""
+    user_input= state.user_input
+    prompt = f """
     Extract the event title, start time, and end time from the following text: "{user_input}"
     Current time is {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.
     
@@ -77,23 +85,28 @@ def extract_event_details(state: CalendarState):
         details["start_time"] = start.strftime("%Y-%m-%dT%H:%M:%S")
         details["end_time"] = end.strftime("%Y-%m-%dT%H:%M:%S")
         
+        event_details = EventDetails(**details)
+        state.event_details = event_details
+
+
     except (ValueError, KeyError) as e:
         raise ValueError(f"DateTime validation failed: {str(e)}")
 
 
-    print(f"Extracted details: {details}")  # Debugging statement
-    state["event_details"] = details
+    print(f"Extracted details: {state.event_details}")  
     return state
 
 # Function to check availability
 def check_availability(state: CalendarState):
-    details = state["event_details"]
-    print(f"Checking availability with details: {details}")  # Debugging statement
+    if not state.event_details:
+        raise ValueError("No event details available")
+        
+    details = state.event_details
+    print(f"Checking availability with details: {details}")
 
     try:
-        # Add timezone suffix for Google Calendar API
-        time_min = f"{details['start_time']}Z"
-        time_max = f"{details['end_time']}Z"
+        time_min = f"{details.start_time}Z"
+        time_max = f"{details.end_time}Z"
         
         print(f"Checking calendar from {time_min} to {time_max}")
         
@@ -107,66 +120,75 @@ def check_availability(state: CalendarState):
         
         events = events_result.get("items", [])
         
+        new_state = state.model_copy()
         if events:
-            state["availability_status"] = f"⚠️ Slot unavailable! You have {len(events)} conflicting event(s)."
+            new_state.availability_status = f"⚠️ Slot unavailable! You have {len(events)} conflicting event(s)."
         else:
-            state["availability_status"] = "✅ Slot available."
+            new_state.availability_status = "✅ Slot available."
             
     except Exception as e:
         print(f"Error checking availability: {str(e)}")
-        state["availability_status"] = f"Error checking availability: {str(e)}"
+        new_state = state.model_copy()
+        new_state.availability_status = f"Error checking availability: {str(e)}"
     
-    return state
+    return new_state
 
 
 
 def end_task(state: CalendarState):
-    """Final node to clean up and return the final state"""
-    if state["status"] == "completed":
-        if not state.get("final_message"):
-            state["final_message"] = "✅ Event successfully booked and added to your calendar!"
-    elif state["status"] == "cancelled":
-        state["final_message"] = "❌ Booking cancelled by user."
-    elif state["status"] == "error":
-        if not state.get("final_message"):
-            state["final_message"] = f"⚠️ Error occurred: {state.get('error_message', 'Unknown error')}"
+
+    new_state = state.model_copy()
+
+    if new_state.status == "completed":
+        if not new_state.final_message:
+            new_state.final_message = "✅ Event successfully booked and added to your calendar!"
+    elif new_state.status == "cancelled":
+        new_state.final_message = "❌ Booking cancelled by user."
+    elif new_state.status == "error":
+        if not new_state.final_message:
+            new_state.final_message = f"⚠️ Error occurred: {new_state.get('error_message', 'Unknown error')}"
     
-    return state
+    return new_state
 
 def confirm_booking(state: CalendarState):
-    details = state["event_details"]
+    if not state.event_details:
+        raise ValueError("No event details available")
+        
+    details = state.event_details
     print(f"Confirming booking with details: {details}")
     
     # Add this line to force confirmation for testing
-    state["confirmation"] = "confirm"  # Temporary fix for testing
-    
-    if state.get("confirmation") == "confirm":
+    new_state = state.model_copy()
+    new_state.confirmation = "confirm"
+
+
+    if new_state.confirmation == "confirm":
         try:
             event = {
-                "summary": details["title"],
-                "start": {"dateTime": f"{details['start_time']}", "timeZone": "UTC"},  # Remove Z suffix
-                "end": {"dateTime": f"{details['end_time']}", "timeZone": "UTC"},      # Remove Z suffix
+                "summary": details.title,
+                "start": {"dateTime": details.start_time, "timeZone": "UTC"},  
+                "end": {"dateTime": details.end_time, "timeZone": "UTC"},      
             }
             
-            print(f"Attempting to book event: {event}")  # Debug print
+            print(f"Attempting to book event: {event}")  
             
             event_result = service.events().insert(calendarId="primary", body=event).execute()
             
-            print(f"Booking result: {event_result}")  # Debug print
+            print(f"Booking result: {event_result}") 
             
-            state["event_link"] = event_result.get('htmlLink')
-            state["status"] = "completed"
-            state["final_message"] = f"✅ Event successfully booked and added to your calendar!\nView event: {state['event_link']}"
+            new_state.event_link = event_result.get('htmlLink', '')
+            new_state.status = "completed"
+            new_state.final_message = f"✅ Event successfully booked and added to your calendar!\nView event: {new_state.event_link}"
             
         except Exception as e:
             print(f"Booking error: {str(e)}")  # Debug print
-            state["status"] = "error"
-            state["error_message"] = str(e)
-            state["final_message"] = f"⚠️ Error booking event: {str(e)}"
+            new_state.status = "error"
+            new_state.error_message = str(e)
+            new_state.final_message = f"⚠️ Error booking event: {str(e)}"
     else:
-        state["status"] = "pending_confirmation"
+        new_state.status = "pending_confirmation"
     
-    return state
+    return new_state
 
 # Define LangGraph nodes
 graph = StateGraph(state_schema=CalendarState)
@@ -217,21 +239,25 @@ if __name__ == "__main__":
             break
             
         try:
-            result = agent.invoke({
-                "user_input": user_input,
-                "event_details": {},
-                "availability_status": "",
-                "confirmation": "",
-                "status": "",
-                "final_message": "",
-                "event_link": "",
-                "error_message": ""
-            })
+            initial_state = CalendarState(
+                user_input= user_input,
+                event_details= None,
+                availability_status= "",
+                confirmation= "",
+                status= "",
+                final_message= "",
+                event_link= "",
+                error_message= ""
+            )
+
+            result = agent.invoke(initial_state.model_dump())
             
-            # Print final message and event link if available
-            print(result["final_message"])
-            if result.get("event_link"):
-                print(f"View event: {result['event_link']}")
+
+            final_state = CalendarState(**result)
+            
+            print(final_state.final_message)
+            if final_state.event_link:
+                print(f"View event: {final_state.event_link}")
             
             continue_booking = input("\nWould you like to book another event? (yes/no): ")
             if continue_booking.lower() != 'yes':
