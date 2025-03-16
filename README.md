@@ -41,7 +41,7 @@ An intelligent calendar management system that uses natural language processing 
 
 3. Set up environment variables:
 - create a .env file in the project folder
-- .env
+  
 - OPENAI_API_KEY=your_openai_api_key
 - GOOGLE_APPLICATION_CREDENTIALS=path_to_your_credentials.json
 
